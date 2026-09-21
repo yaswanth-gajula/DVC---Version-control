@@ -74,10 +74,14 @@ than an oversight.
 
 ```bash
 cd backend
-python3 -m venv venv
+python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
+
+OR TRY THIS
+
+uvicorn app.main:app --reload --reload-dir app --port 8000
 ```
 
 Backend runs at `http://localhost:8000`. Interactive API docs at

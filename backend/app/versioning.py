@@ -30,7 +30,7 @@ from git import Repo, Actor
 
 from .chunking import chunk_content
 
-BASE_DIR = Path(__file__).parent / "data"
+BASE_DIR = Path(__file__).parent.parent / "data"
 PROJECTS_DIR = BASE_DIR / "projects"
 PROJECTS_REGISTRY_PATH = BASE_DIR / "projects.json"
 
