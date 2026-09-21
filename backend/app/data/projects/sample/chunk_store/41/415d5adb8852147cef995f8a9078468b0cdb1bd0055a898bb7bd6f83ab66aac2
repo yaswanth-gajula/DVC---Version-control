@@ -1,0 +1,19 @@
+f;
+            border-left: 6px solid #5aa0ff;
+            border-radius: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Gajula Yaswanth Kumar</h1>
+        <p>I'm currently pursuing Btech in CSE at Kl University. I have CGPA about 9.06.</p>
+
+        <div class="section">
+            <h2>Skills</h2>
+            <ul>
+                <li>Cloud</li>
+                <li>Java</li>
+                <li>Fast typing(60wpm)</li>
+                <li>Problem solving</li>
+                <li>Te
