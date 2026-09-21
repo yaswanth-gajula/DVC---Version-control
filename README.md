@@ -1,4 +1,3 @@
-# CLOUD-119 — CP1 + CP2 Prototype
 ## Data Version Control With Storage Efficiency Across Large Artefacts
 
 A working full-stack system with **two storage engines running side by
