@@ -10,7 +10,7 @@ export default function Sidebar({ projectId }) {
   ];
 
   return (
-    <nav className="w-44 shrink-0 border-r border-border py-6 pr-4">
+    <nav className="w-full sm:w-44 shrink-0 border-b sm:border-b-0 sm:border-r border-border py-4 sm:py-6 pr-0 sm:pr-4">
       <ul className="space-y-1">
         {links.map((link) => (
           <li key={link.to}>

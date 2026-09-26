@@ -1,7 +1,13 @@
 import { useEffect, useState, useCallback } from "react";
 import { BrowserRouter, Routes, Route, Outlet, useParams, Link } from "react-router-dom";
+import { AuthProvider } from "./AuthContext";
+import ProtectedRoute from "./components/ProtectedRoute";
 import Header from "./components/Header";
 import Sidebar from "./components/Sidebar";
+import PageBackdrop from "./components/PageBackdrop";
+import LandingPage from "./pages/LandingPage";
+import LoginPage from "./pages/LoginPage";
+import SignupPage from "./pages/SignupPage";
 import ProjectsListPage from "./pages/ProjectsListPage";
 import OverviewPage from "./pages/OverviewPage";
 import NewVersionPage from "./pages/NewVersionPage";
@@ -46,10 +52,11 @@ function ProjectLayout() {
 
   if (error === "Project not found.") {
     return (
-      <div className="min-h-screen bg-bg flex items-center justify-center">
+      <div className="min-h-screen bg-bg flex items-center justify-center relative">
+        <PageBackdrop variant="project" />
         <div className="text-center">
           <p className="text-sm text-muted mb-2">{error}</p>
-          <Link to="/" className="text-accent text-sm hover:underline">
+          <Link to="/projects" className="text-accent text-sm hover:underline">
             Back to all projects
           </Link>
         </div>
@@ -58,9 +65,10 @@ function ProjectLayout() {
   }
 
   return (
-    <div className="min-h-screen bg-bg">
+    <div className="min-h-screen bg-bg relative">
+      <PageBackdrop variant="project" />
       <Header projectName={project?.name} />
-      <div className="max-w-6xl mx-auto px-6 flex">
+      <div className="max-w-6xl mx-auto px-6 flex flex-col sm:flex-row">
         <Sidebar projectId={projectId} />
         <main className="flex-1 py-6 pl-6 min-w-0">
           {error && (
@@ -77,17 +85,37 @@ function ProjectLayout() {
 
 export default function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<ProjectsListPage />} />
-        <Route path="/p/:projectId" element={<ProjectLayout />}>
-          <Route index element={<OverviewPage />} />
-          <Route path="new" element={<NewVersionPage />} />
-          <Route path="history" element={<HistoryPage />} />
-          <Route path="history/:id" element={<VersionDetailPage />} />
-          <Route path="git-log" element={<GitLogPage />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
+    <AuthProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<LandingPage />} />
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/signup" element={<SignupPage />} />
+
+          <Route
+            path="/projects"
+            element={
+              <ProtectedRoute>
+                <ProjectsListPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/p/:projectId"
+            element={
+              <ProtectedRoute>
+                <ProjectLayout />
+              </ProtectedRoute>
+            }
+          >
+            <Route index element={<OverviewPage />} />
+            <Route path="new" element={<NewVersionPage />} />
+            <Route path="history" element={<HistoryPage />} />
+            <Route path="history/:id" element={<VersionDetailPage />} />
+            <Route path="git-log" element={<GitLogPage />} />
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </AuthProvider>
   );
 }

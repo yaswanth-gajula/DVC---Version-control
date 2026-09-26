@@ -1,20 +1,25 @@
 """
-CP1 versioning engine — now with multiple isolated PROJECTS.
+Local-disk versioning engine, scoped per user.
 
-Every project gets its own working tree, its own Git repo, its own
-full-copy version snapshots, and its own manifest -- nothing is shared
-between projects, so saving a version in "Project A" can never touch
-"Project B"'s files or history.
+Per the explicit scope for this feature: Supabase is used ONLY for
+authentication (login/signup, session tokens). Every user identified by
+`user_id` here is a Supabase Auth user id (verified in auth.py), but all
+project, version, and chunk DATA lives on local disk -- Supabase never
+sees it, exactly as before this feature was added, just now partitioned
+per user instead of shared globally.
 
 Layout on disk:
   data/
-    projects.json              <- registry: [{id, name, created_at}, ...]
-    projects/
-      <project_id>/
-        working/                <- real Git repo for THIS project only
-        versions/
-          v1/, v2/, ...          <- full-copy snapshots for THIS project only
-        manifest.json            <- version metadata for THIS project only
+    users/
+      <user_id>/
+        projects.json                  <- this user's project registry
+        projects/
+          <project_id>/
+            working/                    <- real Git repo for this project
+            versions/v1, v2, ...         <- O2: full-copy snapshots
+            manifest.json                <- O2 metadata
+            chunk_store/xx/<hash>        <- O3: content-addressed chunks
+            dedup_manifest.json          <- O3 metadata
 """
 import json
 import os
@@ -31,38 +36,82 @@ from git import Repo, Actor
 from .chunking import chunk_content
 
 BASE_DIR = Path(__file__).parent.parent / "data"
-PROJECTS_DIR = BASE_DIR / "projects"
-PROJECTS_REGISTRY_PATH = BASE_DIR / "projects.json"
+USERS_DIR = BASE_DIR / "users"
 
 GIT_AUTHOR = Actor("DVC Capstone Prototype", "prototype@dvc-capstone.local")
 
 
 # ---------------------------------------------------------------------------
-# Project registry
+# Per-user, per-project path helpers
 # ---------------------------------------------------------------------------
+
+def _user_dir(user_id: str) -> Path:
+    return USERS_DIR / user_id
+
+
+def _projects_registry_path(user_id: str) -> Path:
+    return _user_dir(user_id) / "projects.json"
+
+
+def _projects_dir(user_id: str) -> Path:
+    return _user_dir(user_id) / "projects"
+
+
+def _project_dir(user_id: str, project_id: str) -> Path:
+    return _projects_dir(user_id) / project_id
+
+
+def _working_dir(user_id: str, project_id: str) -> Path:
+    return _project_dir(user_id, project_id) / "working"
+
+
+def _versions_dir(user_id: str, project_id: str) -> Path:
+    return _project_dir(user_id, project_id) / "versions"
+
+
+def _manifest_path(user_id: str, project_id: str) -> Path:
+    return _project_dir(user_id, project_id) / "manifest.json"
+
+
+def _chunk_store_dir(user_id: str, project_id: str) -> Path:
+    return _project_dir(user_id, project_id) / "chunk_store"
+
+
+def _dedup_manifest_path(user_id: str, project_id: str) -> Path:
+    return _project_dir(user_id, project_id) / "dedup_manifest.json"
+
+
+def _chunk_path(user_id: str, project_id: str, chunk_hash: str) -> Path:
+    return _chunk_store_dir(user_id, project_id) / chunk_hash[:2] / chunk_hash
+
 
 def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug or "project"
 
 
-def _load_registry() -> List[Dict]:
-    if not PROJECTS_REGISTRY_PATH.exists():
+# ---------------------------------------------------------------------------
+# Project registry (per user)
+# ---------------------------------------------------------------------------
+
+def _load_registry(user_id: str) -> List[Dict]:
+    path = _projects_registry_path(user_id)
+    if not path.exists():
         return []
-    with open(PROJECTS_REGISTRY_PATH, "r") as f:
+    with open(path, "r") as f:
         return json.load(f)
 
 
-def _save_registry(registry: List[Dict]) -> None:
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(PROJECTS_REGISTRY_PATH, "w") as f:
+def _save_registry(user_id: str, registry: List[Dict]) -> None:
+    _user_dir(user_id).mkdir(parents=True, exist_ok=True)
+    with open(_projects_registry_path(user_id), "w") as f:
         json.dump(registry, f, indent=2)
 
 
-def list_projects() -> List[Dict]:
-    registry = _load_registry()
+def list_projects(user_id: str) -> List[Dict]:
+    registry = _load_registry(user_id)
     for p in registry:
-        manifest_path = PROJECTS_DIR / p["id"] / "manifest.json"
+        manifest_path = _manifest_path(user_id, p["id"])
         if manifest_path.exists():
             with open(manifest_path) as f:
                 manifest = json.load(f)
@@ -71,15 +120,23 @@ def list_projects() -> List[Dict]:
         else:
             p["version_count"] = 0
             p["total_bytes"] = 0
+
+        dedup_manifest_path = _dedup_manifest_path(user_id, p["id"])
+        if dedup_manifest_path.exists():
+            with open(dedup_manifest_path) as f:
+                dedup_manifest = json.load(f)
+            p["total_dedup_bytes"] = dedup_manifest[-1]["cumulative_dedup_bytes"] if dedup_manifest else 0
+        else:
+            p["total_dedup_bytes"] = 0
     return registry
 
 
-def create_project(name: str) -> Dict:
+def create_project(user_id: str, name: str) -> Dict:
     name = name.strip()
     if not name:
         raise ValueError("Project name cannot be empty")
 
-    registry = _load_registry()
+    registry = _load_registry(user_id)
     base_slug = _slugify(name)
     slug = base_slug
     existing_ids = {p["id"] for p in registry}
@@ -94,82 +151,44 @@ def create_project(name: str) -> Dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     registry.append(entry)
-    _save_registry(registry)
+    _save_registry(user_id, registry)
 
-    project_dir = PROJECTS_DIR / slug
-    (project_dir / "working").mkdir(parents=True, exist_ok=True)
-    (project_dir / "versions").mkdir(parents=True, exist_ok=True)
-    _ensure_repo(slug)
-    _save_manifest(slug, [])
+    _working_dir(user_id, slug).mkdir(parents=True, exist_ok=True)
+    _versions_dir(user_id, slug).mkdir(parents=True, exist_ok=True)
+    _ensure_repo(user_id, slug)
+    _save_manifest(user_id, slug, [])
 
-    return {**entry, "version_count": 0, "total_bytes": 0}
-
-
-def get_project(project_id: str) -> Dict:
-    for p in _load_registry():
-        if p["id"] == project_id:
-            return p
-    raise KeyError(f"project {project_id} not found")
+    return {**entry, "version_count": 0, "total_bytes": 0, "total_dedup_bytes": 0}
 
 
-def delete_project(project_id: str) -> None:
-    registry = _load_registry()
+def delete_project(user_id: str, project_id: str) -> None:
+    registry = _load_registry(user_id)
     new_registry = [p for p in registry if p["id"] != project_id]
     if len(new_registry) == len(registry):
         raise KeyError(f"project {project_id} not found")
-    _save_registry(new_registry)
-    project_dir = PROJECTS_DIR / project_id
+    _save_registry(user_id, new_registry)
+    project_dir = _project_dir(user_id, project_id)
     if project_dir.exists():
         shutil.rmtree(project_dir)
 
 
-# ---------------------------------------------------------------------------
-# Per-project paths
-# ---------------------------------------------------------------------------
-
-def _project_dir(project_id: str) -> Path:
-    return PROJECTS_DIR / project_id
-
-
-def _working_dir(project_id: str) -> Path:
-    return _project_dir(project_id) / "working"
-
-
-def _versions_dir(project_id: str) -> Path:
-    return _project_dir(project_id) / "versions"
-
-
-def _manifest_path(project_id: str) -> Path:
-    return _project_dir(project_id) / "manifest.json"
-
-
-def _chunk_store_dir(project_id: str) -> Path:
-    return _project_dir(project_id) / "chunk_store"
-
-
-def _dedup_manifest_path(project_id: str) -> Path:
-    return _project_dir(project_id) / "dedup_manifest.json"
-
-
-def _chunk_path(project_id: str, chunk_hash: str) -> Path:
-    # Two-char prefix sharding avoids one giant flat directory -- the same
-    # trick Git itself uses for loose objects (.git/objects/xx/rest...).
-    return _chunk_store_dir(project_id) / chunk_hash[:2] / chunk_hash
-
-
-def _assert_project_exists(project_id: str) -> None:
-    if not any(p["id"] == project_id for p in _load_registry()):
+def _assert_project_exists(user_id: str, project_id: str) -> None:
+    if not any(p["id"] == project_id for p in _load_registry(user_id)):
         raise KeyError(f"project {project_id} not found")
 
 
-def _ensure_dirs(project_id: str) -> None:
-    _working_dir(project_id).mkdir(parents=True, exist_ok=True)
-    _versions_dir(project_id).mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Git + naive snapshot helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_dirs(user_id: str, project_id: str) -> None:
+    _working_dir(user_id, project_id).mkdir(parents=True, exist_ok=True)
+    _versions_dir(user_id, project_id).mkdir(parents=True, exist_ok=True)
 
 
-def _ensure_repo(project_id: str) -> Repo:
-    _ensure_dirs(project_id)
-    working = _working_dir(project_id)
+def _ensure_repo(user_id: str, project_id: str) -> Repo:
+    _ensure_dirs(user_id, project_id)
+    working = _working_dir(user_id, project_id)
     if not (working / ".git").exists():
         repo = Repo.init(working)
         repo.index.commit("Initialize repository", author=GIT_AUTHOR, committer=GIT_AUTHOR)
@@ -178,40 +197,35 @@ def _ensure_repo(project_id: str) -> Repo:
     return repo
 
 
-def _load_manifest(project_id: str) -> List[Dict]:
-    path = _manifest_path(project_id)
+def _load_manifest(user_id: str, project_id: str) -> List[Dict]:
+    path = _manifest_path(user_id, project_id)
     if not path.exists():
         return []
     with open(path, "r") as f:
         return json.load(f)
 
 
-def _save_manifest(project_id: str, manifest: List[Dict]) -> None:
-    with open(_manifest_path(project_id), "w") as f:
+def _save_manifest(user_id: str, project_id: str, manifest: List[Dict]) -> None:
+    with open(_manifest_path(user_id, project_id), "w") as f:
         json.dump(manifest, f, indent=2)
 
 
-def _load_dedup_manifest(project_id: str) -> List[Dict]:
-    path = _dedup_manifest_path(project_id)
+def _load_dedup_manifest(user_id: str, project_id: str) -> List[Dict]:
+    path = _dedup_manifest_path(user_id, project_id)
     if not path.exists():
         return []
     with open(path, "r") as f:
         return json.load(f)
 
 
-def _save_dedup_manifest(project_id: str, manifest: List[Dict]) -> None:
-    with open(_dedup_manifest_path(project_id), "w") as f:
+def _save_dedup_manifest(user_id: str, project_id: str, manifest: List[Dict]) -> None:
+    with open(_dedup_manifest_path(user_id, project_id), "w") as f:
         json.dump(manifest, f, indent=2)
 
 
-def _write_chunk_if_new(project_id: str, chunk_bytes: bytes) -> tuple[str, int]:
-    """
-    Store `chunk_bytes` under its content hash if not already present.
-    Returns (hash_hex, bytes_actually_written) -- bytes_actually_written
-    is 0 when the chunk already existed, which is exactly the dedup savings.
-    """
+def _write_chunk_if_new(user_id: str, project_id: str, chunk_bytes: bytes) -> tuple[str, int]:
     chunk_hash = hashlib.sha256(chunk_bytes).hexdigest()
-    path = _chunk_path(project_id, chunk_hash)
+    path = _chunk_path(user_id, project_id, chunk_hash)
     if path.exists():
         return chunk_hash, 0
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,15 +253,15 @@ def _list_files(path: Path) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Versioning operations (all scoped to one project)
+# Versioning operations
 # ---------------------------------------------------------------------------
 
-def save_version(project_id: str, uploaded_files: Dict[str, bytes], message: str) -> Dict:
-    _assert_project_exists(project_id)
-    _ensure_dirs(project_id)
-    repo = _ensure_repo(project_id)
-    working = _working_dir(project_id)
-    versions_dir = _versions_dir(project_id)
+def save_version(user_id: str, project_id: str, uploaded_files: Dict[str, bytes], message: str) -> Dict:
+    _assert_project_exists(user_id, project_id)
+    _ensure_dirs(user_id, project_id)
+    repo = _ensure_repo(user_id, project_id)
+    working = _working_dir(user_id, project_id)
+    versions_dir = _versions_dir(user_id, project_id)
 
     for item in working.iterdir():
         if item.name == ".git":
@@ -271,9 +285,10 @@ def save_version(project_id: str, uploaded_files: Dict[str, bytes], message: str
     else:
         commit_hash = repo.head.commit.hexsha
 
-    manifest = _load_manifest(project_id)
+    manifest = _load_manifest(user_id, project_id)
     version_id = len(manifest) + 1
 
+    # --- O2: naive full-copy baseline ---
     snapshot_dir = versions_dir / f"v{version_id}"
     if snapshot_dir.exists():
         shutil.rmtree(snapshot_dir)
@@ -293,25 +308,21 @@ def save_version(project_id: str, uploaded_files: Dict[str, bytes], message: str
         "cumulative_naive_bytes": cumulative,
     }
     manifest.append(entry)
-    _save_manifest(project_id, manifest)
+    _save_manifest(user_id, project_id, manifest)
 
-    # --- O3: content-addressed, deduplicated storage (the CP2 contribution) ---
-    # Runs on the SAME uploaded files, sharing this version's id/commit/message,
-    # so the two systems land on the same x-axis for direct comparison.
+    # --- O3: content-addressed, deduplicated storage ---
     dedup_files = {}
     new_bytes_written = 0
     for rel_path, content in uploaded_files.items():
         chunk_hashes = []
         for chunk in chunk_content(content):
-            chunk_hash, written = _write_chunk_if_new(project_id, chunk)
+            chunk_hash, written = _write_chunk_if_new(user_id, project_id, chunk)
             chunk_hashes.append(chunk_hash)
             new_bytes_written += written
         dedup_files[rel_path] = {"chunk_hashes": chunk_hashes, "size_bytes": len(content)}
 
-    dedup_manifest = _load_dedup_manifest(project_id)
-    # Real disk usage of the chunk store, not an incremental estimate --
-    # this is the actual number a KPI-1 comparison has to be honest about.
-    cumulative_dedup_bytes = _dir_size_bytes(_chunk_store_dir(project_id))
+    dedup_manifest = _load_dedup_manifest(user_id, project_id)
+    cumulative_dedup_bytes = _dir_size_bytes(_chunk_store_dir(user_id, project_id))
 
     dedup_entry = {
         "id": version_id,
@@ -319,78 +330,71 @@ def save_version(project_id: str, uploaded_files: Dict[str, bytes], message: str
         "commit_hash": commit_hash,
         "created_at": entry["created_at"],
         "file_count": file_count,
-        "total_logical_bytes": total_size,       # what it WOULD cost, uncompressed
-        "new_bytes_written": new_bytes_written,    # what THIS version actually cost
+        "total_logical_bytes": total_size,
+        "new_bytes_written": new_bytes_written,
         "cumulative_dedup_bytes": cumulative_dedup_bytes,
         "files": dedup_files,
     }
     dedup_manifest.append(dedup_entry)
-    _save_dedup_manifest(project_id, dedup_manifest)
+    _save_dedup_manifest(user_id, project_id, dedup_manifest)
 
     return entry
 
 
-def list_versions(project_id: str) -> List[Dict]:
-    _assert_project_exists(project_id)
-    return _load_manifest(project_id)
+def list_versions(user_id: str, project_id: str) -> List[Dict]:
+    _assert_project_exists(user_id, project_id)
+    return _load_manifest(user_id, project_id)
 
 
-def get_version(project_id: str, version_id: int) -> Dict:
-    for entry in _load_manifest(project_id):
+def get_version(user_id: str, project_id: str, version_id: int) -> Dict:
+    for entry in _load_manifest(user_id, project_id):
         if entry["id"] == version_id:
-            return entry
-    raise KeyError(f"version {version_id} not found in project {project_id}")
+            files = _list_files(_versions_dir(user_id, project_id) / f"v{version_id}")
+            return {**entry, "files": files}
+    raise KeyError(f"version {version_id} not found")
 
 
-def get_version_files(project_id: str, version_id: int) -> List[Dict]:
-    snapshot_dir = _versions_dir(project_id) / f"v{version_id}"
+def get_version_dir(user_id: str, project_id: str, version_id: int) -> Path:
+    snapshot_dir = _versions_dir(user_id, project_id) / f"v{version_id}"
     if not snapshot_dir.exists():
-        raise KeyError(f"version {version_id} not found in project {project_id}")
-    return _list_files(snapshot_dir)
-
-
-def get_version_dir(project_id: str, version_id: int) -> Path:
-    snapshot_dir = _versions_dir(project_id) / f"v{version_id}"
-    if not snapshot_dir.exists():
-        raise KeyError(f"version {version_id} not found in project {project_id}")
+        raise KeyError(f"version {version_id} not found")
     return snapshot_dir
 
 
-def storage_growth(project_id: str) -> List[Dict]:
-    _assert_project_exists(project_id)
+def download_naive_zip(user_id: str, project_id: str, version_id: int) -> Path:
+    return get_version_dir(user_id, project_id, version_id)
+
+
+def storage_growth(user_id: str, project_id: str) -> List[Dict]:
+    _assert_project_exists(user_id, project_id)
     return [
         {"version": e["id"], "cumulative_naive_bytes": e["cumulative_naive_bytes"]}
-        for e in _load_manifest(project_id)
+        for e in _load_manifest(user_id, project_id)
     ]
 
 
-def dedup_storage_growth(project_id: str) -> List[Dict]:
-    _assert_project_exists(project_id)
+def dedup_storage_growth(user_id: str, project_id: str) -> List[Dict]:
+    _assert_project_exists(user_id, project_id)
     return [
         {"version": e["id"], "cumulative_dedup_bytes": e["cumulative_dedup_bytes"]}
-        for e in _load_dedup_manifest(project_id)
+        for e in _load_dedup_manifest(user_id, project_id)
     ]
 
 
-def get_dedup_version(project_id: str, version_id: int) -> Dict:
-    for entry in _load_dedup_manifest(project_id):
+def get_dedup_version(user_id: str, project_id: str, version_id: int) -> Dict:
+    for entry in _load_dedup_manifest(user_id, project_id):
         if entry["id"] == version_id:
             return entry
-    raise KeyError(f"dedup version {version_id} not found in project {project_id}")
+    raise KeyError(f"dedup version {version_id} not found")
 
 
-def reconstruct_version_files(project_id: str, version_id: int) -> Dict[str, bytes]:
-    """
-    Rebuild every file in a version purely from stored chunks -- this is
-    the O4 "efficient retrieval" proof: the dedup store isn't just a size
-    trick, it can actually reproduce the exact original bytes on demand.
-    """
-    entry = get_dedup_version(project_id, version_id)
+def reconstruct_version_files(user_id: str, project_id: str, version_id: int) -> Dict[str, bytes]:
+    entry = get_dedup_version(user_id, project_id, version_id)
     result = {}
     for rel_path, file_info in entry["files"].items():
         pieces = []
         for chunk_hash in file_info["chunk_hashes"]:
-            path = _chunk_path(project_id, chunk_hash)
+            path = _chunk_path(user_id, project_id, chunk_hash)
             with open(path, "rb") as f:
                 pieces.append(f.read())
         result[rel_path] = b"".join(pieces)
@@ -405,9 +409,9 @@ def _read_text_safe(path: Path) -> List[str] | None:
         return None
 
 
-def diff_versions(project_id: str, from_id: int, to_id: int) -> List[Dict]:
-    from_dir = get_version_dir(project_id, from_id)
-    to_dir = get_version_dir(project_id, to_id)
+def diff_versions(user_id: str, project_id: str, from_id: int, to_id: int) -> List[Dict]:
+    from_dir = get_version_dir(user_id, project_id, from_id)
+    to_dir = get_version_dir(user_id, project_id, to_id)
 
     from_files = {e["path"] for e in _list_files(from_dir)}
     to_files = {e["path"] for e in _list_files(to_dir)}
@@ -436,9 +440,9 @@ def diff_versions(project_id: str, from_id: int, to_id: int) -> List[Dict]:
     return results
 
 
-def git_log(project_id: str) -> List[Dict]:
-    _assert_project_exists(project_id)
-    repo = _ensure_repo(project_id)
+def git_log(user_id: str, project_id: str) -> List[Dict]:
+    _assert_project_exists(user_id, project_id)
+    repo = _ensure_repo(user_id, project_id)
     entries = []
     for commit in repo.iter_commits():
         entries.append({

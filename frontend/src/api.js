@@ -1,8 +1,22 @@
 import axios from "axios";
+import { supabase } from "./supabaseClient";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 const client = axios.create({ baseURL: API_BASE });
+
+// Every request carries the current Supabase session's access token, so
+// the backend can verify identity and scope data to this user. getSession()
+// reads from local storage and refreshes if needed -- it does not require
+// a network round trip on every call.
+client.interceptors.request.use(async (config) => {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
 
 export const api = {
   listProjects: () => client.get("/api/projects").then((r) => r.data),

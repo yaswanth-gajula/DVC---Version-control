@@ -1,18 +1,23 @@
 """
 CLOUD-119 -- Data Version Control With Storage Efficiency Across Large Artefacts
-CP1 prototype backend. Every version endpoint is scoped under a project id,
-so multiple independent projects can be tracked side by side without
-sharing working trees, Git history, or storage.
+
+Every route below (except /api/health) depends on get_current_user_id,
+which verifies the Supabase Auth access token the frontend sends in the
+Authorization header. Supabase is used ONLY for authentication -- the
+extracted user id is used purely to partition LOCAL DISK storage (see
+versioning.py), so a user can only ever see or touch their own projects.
+No project, version, or chunk data is ever sent to Supabase.
 """
 import io
 import zipfile
 from typing import List
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from . import versioning
+from .auth import get_current_user_id
 from .schemas import (
     ProjectSummary, CreateProjectRequest,
     VersionSummary, VersionDetail, StoragePoint, DedupStoragePoint, DiffResponse, SaveVersionResponse
@@ -20,13 +25,13 @@ from .schemas import (
 
 app = FastAPI(
     title="DVC Capstone Prototype API",
-    description="CP1 naive versioning baseline for CLOUD-119 -- multi-project",
-    version="0.2.0",
+    description="CLOUD-119 -- multi-project, multi-user (Supabase Auth only; all data local)",
+    version="0.3.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # prototype only -- tighten to your frontend's origin before any real deployment
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,22 +48,22 @@ def health():
 # ---------------------------------------------------------------------------
 
 @app.get("/api/projects", response_model=List[ProjectSummary])
-def get_projects():
-    return versioning.list_projects()
+def get_projects(user_id: str = Depends(get_current_user_id)):
+    return versioning.list_projects(user_id)
 
 
 @app.post("/api/projects", response_model=ProjectSummary)
-def post_project(body: CreateProjectRequest):
+def post_project(body: CreateProjectRequest, user_id: str = Depends(get_current_user_id)):
     try:
-        return versioning.create_project(body.name)
+        return versioning.create_project(user_id, body.name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.delete("/api/projects/{project_id}")
-def remove_project(project_id: str):
+def remove_project(project_id: str, user_id: str = Depends(get_current_user_id)):
     try:
-        versioning.delete_project(project_id)
+        versioning.delete_project(user_id, project_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Project not found")
     return {"status": "deleted"}
@@ -73,6 +78,7 @@ async def create_version(
     project_id: str,
     message: str = Form(...),
     files: List[UploadFile] = File(...),
+    user_id: str = Depends(get_current_user_id),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
@@ -84,34 +90,32 @@ async def create_version(
         uploaded[rel_path] = content
 
     try:
-        entry = versioning.save_version(project_id, uploaded, message)
+        entry = versioning.save_version(user_id, project_id, uploaded, message)
     except KeyError:
         raise HTTPException(status_code=404, detail="Project not found")
     return {"version": entry}
 
 
 @app.get("/api/projects/{project_id}/versions", response_model=List[VersionSummary])
-def get_versions(project_id: str):
+def get_versions(project_id: str, user_id: str = Depends(get_current_user_id)):
     try:
-        return versioning.list_versions(project_id)
+        return versioning.list_versions(user_id, project_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Project not found")
 
 
 @app.get("/api/projects/{project_id}/versions/{version_id}", response_model=VersionDetail)
-def get_version_detail(project_id: str, version_id: int):
+def get_version_detail(project_id: str, version_id: int, user_id: str = Depends(get_current_user_id)):
     try:
-        entry = versioning.get_version(project_id, version_id)
-        files = versioning.get_version_files(project_id, version_id)
+        return versioning.get_version(user_id, project_id, version_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Version not found")
-    return {**entry, "files": files}
 
 
 @app.get("/api/projects/{project_id}/versions/{version_id}/download")
-def download_version(project_id: str, version_id: int):
+def download_version(project_id: str, version_id: int, user_id: str = Depends(get_current_user_id)):
     try:
-        snapshot_dir = versioning.get_version_dir(project_id, version_id)
+        snapshot_dir = versioning.download_naive_zip(user_id, project_id, version_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Version not found")
 
@@ -128,31 +132,15 @@ def download_version(project_id: str, version_id: int):
     )
 
 
-@app.get("/api/projects/{project_id}/stats/storage-growth", response_model=List[StoragePoint])
-def storage_growth(project_id: str):
-    try:
-        return versioning.storage_growth(project_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-
-@app.get("/api/projects/{project_id}/stats/dedup-growth", response_model=List[DedupStoragePoint])
-def dedup_growth(project_id: str):
-    try:
-        return versioning.dedup_storage_growth(project_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-
 @app.get("/api/projects/{project_id}/versions/{version_id}/download-dedup")
-def download_version_from_dedup(project_id: str, version_id: int):
+def download_version_from_dedup(project_id: str, version_id: int, user_id: str = Depends(get_current_user_id)):
     """
     Same output as /download, but reconstructed purely from the
     content-addressed chunk store -- proves retrieval actually works,
     not just that the size numbers look good.
     """
     try:
-        files = versioning.reconstruct_version_files(project_id, version_id)
+        files = versioning.reconstruct_version_files(user_id, project_id, version_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Version not found")
 
@@ -168,18 +156,34 @@ def download_version_from_dedup(project_id: str, version_id: int):
     )
 
 
-@app.get("/api/projects/{project_id}/diff", response_model=DiffResponse)
-def diff(project_id: str, from_version: int, to_version: int):
+@app.get("/api/projects/{project_id}/stats/storage-growth", response_model=List[StoragePoint])
+def storage_growth(project_id: str, user_id: str = Depends(get_current_user_id)):
     try:
-        files = versioning.diff_versions(project_id, from_version, to_version)
+        return versioning.storage_growth(user_id, project_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
+@app.get("/api/projects/{project_id}/stats/dedup-growth", response_model=List[DedupStoragePoint])
+def dedup_growth(project_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        return versioning.dedup_storage_growth(user_id, project_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+
+@app.get("/api/projects/{project_id}/diff", response_model=DiffResponse)
+def diff(project_id: str, from_version: int, to_version: int, user_id: str = Depends(get_current_user_id)):
+    try:
+        files = versioning.diff_versions(user_id, project_id, from_version, to_version)
     except KeyError:
         raise HTTPException(status_code=404, detail="Project or version not found")
     return {"from_version": from_version, "to_version": to_version, "files": files}
 
 
 @app.get("/api/projects/{project_id}/git-log")
-def get_git_log(project_id: str):
+def get_git_log(project_id: str, user_id: str = Depends(get_current_user_id)):
     try:
-        return versioning.git_log(project_id)
+        return versioning.git_log(user_id, project_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Project not found")

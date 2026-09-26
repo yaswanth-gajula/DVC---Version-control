@@ -6,11 +6,12 @@ from pydantic import BaseModel
 
 
 class ProjectSummary(BaseModel):
-    id: str                 # URL-safe slug, e.g. "billing-service"
-    name: str                # display name, e.g. "Billing Service"
+    id: str                  # local slug, e.g. "billing-service"
+    name: str                 # display name, e.g. "Billing Service"
     created_at: str
     version_count: int
-    total_bytes: int
+    total_bytes: int          # O2 naive cumulative bytes (latest version)
+    total_dedup_bytes: int    # O3 dedup cumulative bytes (latest version)
 
 
 class CreateProjectRequest(BaseModel):
